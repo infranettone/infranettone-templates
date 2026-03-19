@@ -100,14 +100,27 @@ fetch_secret_string() {
     --output text
 }
 
+ensure_secret_loaded() {
+  [[ -n "${SECRET_STRING:-}" ]] && return 0
+
+  [[ -n "${AWS_PROFILE:-}" ]] || die "AWS_PROFILE is not configured."
+  [[ -n "${AWS_REGION:-}" ]] || die "AWS_REGION is not configured."
+  [[ -n "${AWS_SECRET_NAME:-}" ]] || die "AWS_SECRET_NAME is not configured."
+
+  declare -g SECRET_STRING
+  SECRET_STRING="$(fetch_secret_string "$AWS_PROFILE" "$AWS_REGION" "$AWS_SECRET_NAME")"
+}
+
 secret_string_is_json() {
   require_command jq
+  ensure_secret_loaded
   jq -e . >/dev/null 2>&1 <<<"$SECRET_STRING"
 }
 
 get_secret_json_field() {
   local field_name="$1"
 
+  ensure_secret_loaded
   secret_string_is_json || die "Current secret is not valid JSON."
   jq -r --arg key "$field_name" '.[$key] // empty' <<<"$SECRET_STRING"
 }
@@ -119,26 +132,41 @@ save_config() {
 AWS_PROFILE=$(printf "%q" "$AWS_PROFILE")
 AWS_REGION=$(printf "%q" "$AWS_REGION")
 AWS_SECRET_NAME=$(printf "%q" "$AWS_SECRET_NAME")
-SECRET_STRING=$(printf "%q" "$SECRET_STRING")
 EOF
 
   chmod 600 "$config_file"
 }
 
+config_has_persisted_secret() {
+  local config_file="$1"
+
+  [[ -f "$config_file" ]] || return 1
+  grep -Eq '^SECRET_STRING=' "$config_file"
+}
+
 load_config() {
   local config_file="$1"
   local key=""
+  local had_persisted_secret=1
 
   [[ -f "$config_file" ]] || die "Config file not found: $config_file"
+  config_has_persisted_secret "$config_file" && had_persisted_secret=0
 
   # shellcheck disable=SC1090
   source "$config_file"
 
   declare -g AWS_PROFILE AWS_REGION AWS_SECRET_NAME SECRET_STRING
 
-  for key in AWS_PROFILE AWS_REGION AWS_SECRET_NAME SECRET_STRING; do
+  for key in AWS_PROFILE AWS_REGION AWS_SECRET_NAME; do
     [[ -n "${!key:-}" ]] || die "Config file is missing required value: $key"
   done
+
+  SECRET_STRING=""
+
+  if [[ "$had_persisted_secret" -eq 0 ]]; then
+    info "Removing persisted secret material from $config_file"
+    save_config "$config_file"
+  fi
 }
 
 bootstrap_aws_context() {
@@ -157,9 +185,8 @@ bootstrap_aws_context() {
   mapfile -t secrets < <(list_secret_names "$AWS_PROFILE" "$AWS_REGION")
   declare -g AWS_SECRET_NAME
   AWS_SECRET_NAME="$(select_from_options $'Select the AWS secret: ' secrets)"
-
   declare -g SECRET_STRING
-  SECRET_STRING="$(fetch_secret_string "$AWS_PROFILE" "$AWS_REGION" "$AWS_SECRET_NAME")"
+  SECRET_STRING=""
 }
 
 configure_and_save_context() {
